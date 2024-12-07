@@ -3,4 +3,6 @@ project(reduce_pipelining_test)
 
 set(CMAKE_CXX_STANDARD 20)
 
-add_executable(reduce_pipelining_test main.cpp)
+add_executable(half_duplex_test half_duplex.cpp)
+
+add_executable(full_duplex_test full_duplex.cpp)

@@ -118,7 +118,6 @@ int main(const int argc, char **argv) {
 
         int tx_socket;
         int retries = 0;
-        constexpr int max_retries = 10;
         while (true) {
             tx_socket = socket(AF_INET, SOCK_STREAM, 0);
             if (tx_socket == -1) {
@@ -138,7 +137,7 @@ int main(const int argc, char **argv) {
                 close(tx_socket); // Close the failed socket before retrying
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 retries++;
-                if (retries >= max_retries) {
+                if (constexpr int max_retries = 10; retries >= max_retries) {
                     std::cerr << "[Rank: " << rank << "] Exceeded maximum retries to connect to peer rank=" << i <<
                             std::endl;
                     return 1;
@@ -186,32 +185,40 @@ int main(const int argc, char **argv) {
 
     const int next_tx_socket = peer_tx_sockets[next_rank];
 
-    uint64_t total_time = 0;
+    uint64_t cumulative_recv_time = 0;
+
+    constexpr size_t max_buffer_size = (1 << 20) * 10; // 10 MB
 
     if (!should_initiate_ring && prev_rank >= 0) {
         const int prev_rx_socket = peer_rx_sockets[prev_rank];
         const std::unique_ptr<float[]> recv_buffer_ptr(new float[num_elements]);
         const std::span recv_buffer(recv_buffer_ptr.get(), num_elements);
 
-        const auto start = std::chrono::high_resolution_clock::now();
+        uint64_t total_time_read_ns = 0;
 
         // receive data from previous rank
         size_t bytes_received = 0;
         while (bytes_received < recv_buffer.size_bytes()) {
             const size_t bytes_remaining = recv_buffer.size_bytes() - bytes_received;
+            const size_t to_receive = bytes_remaining < max_buffer_size ? bytes_remaining : max_buffer_size;
+
+            auto recv_start = std::chrono::high_resolution_clock::now();
             const size_t bytes_received_now = recv(prev_rx_socket,
                                                    reinterpret_cast<uint8_t *>(recv_buffer.data()) + bytes_received,
-                                                   bytes_remaining, 0);
+                                                   to_receive, 0);
+            auto recv_end = std::chrono::high_resolution_clock::now();
+
             if (bytes_received_now == -1) {
-                std::cerr << "[Rank: " << rank << "] Failed to receive data from previous rank" << std::endl;
+                std::cerr << "[Rank: " << rank << "] Failed to receive data from previous rank: " << strerror(errno) <<
+                        std::endl;
                 return 1;
             }
+            total_time_read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(recv_end - recv_start).count();
+
             bytes_received += bytes_received_now;
         }
 
-        const auto end = std::chrono::high_resolution_clock::now();
-        const auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-        total_time += duration;
+        cumulative_recv_time += total_time_read_ns;
 
         // receive cumulative time from previous rank
         uint64_t cumulative_time_network;
@@ -220,7 +227,7 @@ int main(const int argc, char **argv) {
             return 1;
         }
         const uint64_t cumulative_time = ntohll(cumulative_time_network);
-        total_time += cumulative_time;
+        cumulative_recv_time += cumulative_time;
 
         // shutdown write side of rx socket
         if (shutdown(prev_rx_socket, SHUT_WR) == -1) {
@@ -232,26 +239,27 @@ int main(const int argc, char **argv) {
         while (recv(prev_rx_socket, &dummy, sizeof(dummy), 0) > 0) {
         }
 
+        /*
         // perform reduction
         for (size_t i = 0; i < num_elements; ++i) {
             result[i] += recv_buffer[i];
-        }
+        }*/
     }
     if (next_rank < world_size) {
         // send data to next rank
         size_t bytes_sent = 0;
         while (bytes_sent < result.size_bytes()) {
             const size_t bytes_remaining = result.size_bytes() - bytes_sent;
-            const size_t bytes_sent_now = write(next_tx_socket, result.data() + bytes_sent, bytes_remaining);
+            const size_t to_send = bytes_remaining < max_buffer_size ? bytes_remaining : max_buffer_size;
+            const size_t bytes_sent_now = send(next_tx_socket, reinterpret_cast<uint8_t *>(result.data()) + bytes_sent,
+                                               to_send, 0);
             if (bytes_sent_now == -1) {
-                // get reason for send failure
-
                 return 1;
             }
             bytes_sent += bytes_sent_now;
         }
         // send cumulative time to next rank
-        const uint64_t cumulative_time_network = htonll(total_time);
+        const uint64_t cumulative_time_network = htonll(cumulative_recv_time);
         if (send(next_tx_socket, &cumulative_time_network, sizeof(cumulative_time_network), 0) == -1) {
             std::cerr << "[Rank: " << rank << "] Failed to send cumulative time to next rank" << std::endl;
             return 1;
@@ -266,8 +274,8 @@ int main(const int argc, char **argv) {
         while (recv(next_tx_socket, &dummy, sizeof(dummy), 0) > 0) {
         }
     }
-    std::cout << "[Rank: " << rank << "] Total reduce time after rank " << rank << ": " << (
-        static_cast<double>(total_time) / 1'000'000.0) << " ms" << std::endl;
+    std::cout << "[Rank: " << rank << "] Total recv time after rank " << rank << ": " << (
+        static_cast<double>(cumulative_recv_time) / 1'000'000.0) << " ms" << std::endl;
     if (next_rank == world_size) {
         // the reduce phase of the ring reduce is complete
         // we only simulate the reduce phase here because it is
