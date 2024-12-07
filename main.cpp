@@ -9,10 +9,8 @@
 
 #define BASE_PORT 48148
 
-void fill_constant(std::span<float> span, const float value) {
-    for (float &elem: span) {
-        elem = value;
-    }
+void fill_constant(std::span<float> &span, const float value) {
+    std::ranges::fill(span, value);
 }
 
 int main(const int argc, char **argv) {
@@ -169,7 +167,7 @@ int main(const int argc, char **argv) {
     std::cout << "[Rank: " << rank << "] P2P RX connections established!" << std::endl;
 
     const std::unique_ptr<float[]> result_ptr(new float[num_elements]);
-    const std::span result(result_ptr.get(), num_elements);
+    std::span result(result_ptr.get(), num_elements);
 
     fill_constant(result, 1.0f);
 
