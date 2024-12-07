@@ -6,11 +6,27 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <sys/fcntl.h>
+#include <netinet/tcp.h>
 
 #define BASE_PORT 48148
 
 void fill_constant(std::span<float> &span, const float value) {
     std::ranges::fill(span, value);
+}
+
+bool set_non_blocking(const int socket_fd) {
+    int flags = fcntl(socket_fd, F_GETFL, 0);
+    if (flags == -1) return false;
+    flags |= O_NONBLOCK;
+    return (fcntl(socket_fd, F_SETFL, flags) != -1);
+}
+
+bool set_blocking(const int socket_fd) {
+    int flags = fcntl(socket_fd, F_GETFL, 0);
+    if (flags == -1) return false;
+    flags &= ~O_NONBLOCK;
+    return (fcntl(socket_fd, F_SETFL, flags) != -1);
 }
 
 int main(const int argc, char **argv) {
@@ -47,6 +63,11 @@ int main(const int argc, char **argv) {
         std::cerr << "Failed to set socket option" << std::endl;
         return 1;
     }
+    // disable nagle's algorithm
+    /*if (setsockopt(listen_socket, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(int)) == -1) {
+        std::cerr << "Failed to set TCP_NODELAY" << std::endl;
+        return 1;
+    }*/
 
     // bind to port
     sockaddr_in listen_address{};
@@ -186,11 +207,17 @@ int main(const int argc, char **argv) {
     const int next_tx_socket = peer_tx_sockets[next_rank];
 
     uint64_t cumulative_recv_time = 0;
+    constexpr size_t max_buffer_size = (1 << 20) * 100; // 100 MB
 
-    constexpr size_t max_buffer_size = (1 << 20) * 10; // 10 MB
+    int sndbuf_size = 8 * 1024 * 1024; // 8MB
+    int rcvbuf_size = 8 * 1024 * 1024; // 8MB
+    setsockopt(next_tx_socket, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
 
     if (!should_initiate_ring && prev_rank >= 0) {
         const int prev_rx_socket = peer_rx_sockets[prev_rank];
+        setsockopt(prev_rx_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
+        set_non_blocking(prev_rx_socket);
+
         const std::unique_ptr<float[]> recv_buffer_ptr(new float[num_elements]);
         const std::span recv_buffer(recv_buffer_ptr.get(), num_elements);
 
@@ -199,26 +226,58 @@ int main(const int argc, char **argv) {
         // receive data from previous rank
         size_t bytes_received = 0;
         while (bytes_received < recv_buffer.size_bytes()) {
-            const size_t bytes_remaining = recv_buffer.size_bytes() - bytes_received;
-            const size_t to_receive = bytes_remaining < max_buffer_size ? bytes_remaining : max_buffer_size;
+            // timed recv
+            {
+                const size_t bytes_remaining = recv_buffer.size_bytes() - bytes_received;
+                const size_t to_receive = std::min(bytes_remaining, max_buffer_size);
+                fd_set read_fds;
+                FD_ZERO(&read_fds);
+                FD_SET(prev_rx_socket, &read_fds);
 
-            auto recv_start = std::chrono::high_resolution_clock::now();
-            const size_t bytes_received_now = recv(prev_rx_socket,
-                                                   reinterpret_cast<uint8_t *>(recv_buffer.data()) + bytes_received,
-                                                   to_receive, 0);
-            auto recv_end = std::chrono::high_resolution_clock::now();
+                // Optional: Set a timeout for select
+                timeval timeout{};
+                timeout.tv_sec = 5; // 5 seconds timeout
+                timeout.tv_usec = 0;
 
-            if (bytes_received_now == -1) {
-                std::cerr << "[Rank: " << rank << "] Failed to receive data from previous rank: " << strerror(errno) <<
-                        std::endl;
-                return 1;
+                if (int ready = select(prev_rx_socket + 1, &read_fds, nullptr, nullptr, &timeout); ready == -1) {
+                    std::cerr << "[Rank: " << rank << "] select() failed: " << strerror(errno) << std::endl;
+                    return 1;
+                } else if (ready == 0) {
+                    // timed out, just retry...
+                    continue;
+                }
+
+                // Data is ready to be read
+                auto recv_start = std::chrono::high_resolution_clock::now();
+                ssize_t bytes_received_now = recv(prev_rx_socket,
+                                                  reinterpret_cast<uint8_t *>(recv_buffer.data()) + bytes_received,
+                                                  to_receive, 0);
+                auto recv_end = std::chrono::high_resolution_clock::now();
+
+                uint64_t recv_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(recv_end - recv_start).
+                        count();
+                total_time_read_ns += recv_time_ns;
+
+                if (bytes_received_now == -1) {
+                    if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                        // No data available, continue
+                        continue;
+                    }
+                    std::cerr << "[Rank: " << rank << "] Failed to receive data from previous rank: "
+                            << strerror(errno) << std::endl;
+                    return 1;
+                }
+                if (bytes_received_now == 0) {
+                    // Connection closed
+                    break;
+                }
+                bytes_received += bytes_received_now;
             }
-            total_time_read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(recv_end - recv_start).count();
-
-            bytes_received += bytes_received_now;
         }
 
         cumulative_recv_time += total_time_read_ns;
+
+        set_blocking(next_tx_socket);
 
         // receive cumulative time from previous rank
         uint64_t cumulative_time_network;
@@ -245,12 +304,13 @@ int main(const int argc, char **argv) {
             result[i] += recv_buffer[i];
         }*/
     }
+
     if (next_rank < world_size) {
         // send data to next rank
         size_t bytes_sent = 0;
         while (bytes_sent < result.size_bytes()) {
             const size_t bytes_remaining = result.size_bytes() - bytes_sent;
-            const size_t to_send = bytes_remaining < max_buffer_size ? bytes_remaining : max_buffer_size;
+            const size_t to_send = std::min(bytes_remaining, max_buffer_size);
             const size_t bytes_sent_now = send(next_tx_socket, reinterpret_cast<uint8_t *>(result.data()) + bytes_sent,
                                                to_send, 0);
             if (bytes_sent_now == -1) {

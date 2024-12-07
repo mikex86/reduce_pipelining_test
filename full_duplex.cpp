@@ -6,11 +6,27 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <netinet/tcp.h>
 
 #define BASE_PORT 48148
 
 void fill_constant(std::span<float> &span, const float value) {
-    std::ranges::fill(span, value);
+    std::fill_n(span.data(), span.size(), value);
+}
+
+bool set_non_blocking(const int socket_fd) {
+    int flags = fcntl(socket_fd, F_GETFL, 0);
+    if (flags == -1) return false;
+    flags |= O_NONBLOCK;
+    return (fcntl(socket_fd, F_SETFL, flags) != -1);
+}
+
+bool set_blocking(const int socket_fd) {
+    int flags = fcntl(socket_fd, F_GETFL, 0);
+    if (flags == -1) return false;
+    flags &= ~O_NONBLOCK;
+    return (fcntl(socket_fd, F_SETFL, flags) != -1);
 }
 
 int main(const int argc, char **argv) {
@@ -187,7 +203,6 @@ int main(const int argc, char **argv) {
 
     uint64_t cumulative_recv_time = 0;
 
-
     // perform main transmit loop
     {
         const int prev_rx_socket = peer_rx_sockets[prev_rank];
@@ -205,21 +220,50 @@ int main(const int argc, char **argv) {
             if (!should_initiate_ring) {
                 assert(prev_rank >= 0);
 
-                // both read and write
-                const size_t bytes_remaining = recv_buffer.size_bytes() - total_bytes_processed;
-                const size_t to_read = bytes_remaining < max_buffer_size ? bytes_remaining : max_buffer_size;
+                size_t bytes_remaining = recv_buffer.size_bytes() - total_bytes_processed;
+                size_t to_read = std::min(bytes_remaining, max_buffer_size);
 
+                fd_set read_fds;
+                FD_ZERO(&read_fds);
+                FD_SET(prev_rx_socket, &read_fds);
+
+                // Optional: Set a timeout for select
+                timeval timeout{};
+                timeout.tv_sec = 5;  // 5 seconds timeout
+                timeout.tv_usec = 0;
+
+                if (int ready = select(prev_rx_socket + 1, &read_fds, nullptr, nullptr, &timeout); ready == -1) {
+                    std::cerr << "[Rank: " << rank << "] select() failed: " << strerror(errno) << std::endl;
+                    return 1;
+                } else if (ready == 0) {
+                    // timed out, just retry...
+                    continue;
+                }
+
+                // Data is ready to be read
                 auto recv_start = std::chrono::high_resolution_clock::now();
-                const size_t bytes_received_now = recv(prev_rx_socket,
-                                                       reinterpret_cast<uint8_t *>(recv_buffer.data()) +
-                                                       total_bytes_processed,
-                                                       to_read, 0);
+                ssize_t bytes_received_now = recv(prev_rx_socket,
+                                                 reinterpret_cast<uint8_t *>(recv_buffer.data()) + total_bytes_processed,
+                                                 to_read, 0);
                 auto recv_end = std::chrono::high_resolution_clock::now();
+
                 if (bytes_received_now == -1) {
-                    std::cerr << "[Rank: " << rank << "] Failed to receive data from previous rank" << std::endl;
+                    if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                        // No data available, continue
+                        continue;
+                    }
+                    std::cerr << "[Rank: " << rank << "] Failed to receive data from previous rank: "
+                            << strerror(errno) << std::endl;
                     return 1;
                 }
-                total_time_read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(recv_end - recv_start).count();
+                if (bytes_received_now == 0) {
+                    // Connection closed
+                    break;
+                }
+
+                // Measure only the time spent in recv()
+                uint64_t recv_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(recv_end - recv_start).count();
+                total_time_read_ns += recv_time_ns;
 
                 if (next_rank < world_size) {
                     // sending the bytes we just received
@@ -258,6 +302,9 @@ int main(const int argc, char **argv) {
             }
         }
         cumulative_recv_time += total_time_read_ns;
+
+        // make prev rx socket blocking again
+        set_blocking(prev_rx_socket);
 
         if (prev_rank >= 0) {
             // receive cumulative time from previous rank
