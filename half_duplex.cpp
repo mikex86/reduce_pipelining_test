@@ -10,11 +10,13 @@
 #include <netinet/tcp.h>
 #include <unordered_map>
 #include <cstring>
+#include <vector>
+#include <sstream>
 
 #define BASE_PORT 48148
 
 void fill_constant(std::span<float> &span, const float value) {
-    std::ranges::fill(span, value);
+    std::fill_n(span.data(), span.size(), value);
 }
 
 bool set_non_blocking(const int socket_fd) {

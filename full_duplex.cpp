@@ -10,6 +10,8 @@
 #include <netinet/tcp.h>
 #include <unordered_map>
 #include <cstring>
+#include <vector>
+#include <sstream>
 
 #define BASE_PORT 48148
 
