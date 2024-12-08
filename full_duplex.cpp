@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
+#include <unordered_map>
+#include <cstring>
 
 #define BASE_PORT 48148
 
@@ -120,6 +122,17 @@ int main(const int argc, char **argv) {
         }
     });
 
+    std::vector<std::string> rank_ips{};
+    rank_ips.reserve(world_size);
+
+    if (const char *rank_ips_env = std::getenv("RANK_IPS"); rank_ips_env != nullptr) {
+        std::istringstream rank_ips_stream(rank_ips_env);
+        std::string ip;
+        while (std::getline(rank_ips_stream, ip, ';')) {
+            rank_ips.push_back(ip);
+        }
+    }
+
     // establish all tx connections
     std::unordered_map</* rank */int, /* socket fd */int> peer_tx_sockets{};
     peer_tx_sockets.reserve(world_size);
@@ -144,7 +157,12 @@ int main(const int argc, char **argv) {
             int peer_port = BASE_PORT + i;
             sockaddr_in peer_address{};
             peer_address.sin_family = AF_INET;
-            peer_address.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+            if (rank_ips.empty())
+                peer_address.sin_addr.s_addr = inet_addr("127.0.0.1");
+            else
+                peer_address.sin_addr.s_addr = inet_addr(rank_ips[i].c_str());
+
             peer_address.sin_port = htons(peer_port);
 
             if (connect(tx_socket, reinterpret_cast<sockaddr *>(&peer_address), sizeof(peer_address)) == -1) {
@@ -229,7 +247,7 @@ int main(const int argc, char **argv) {
 
                 // Optional: Set a timeout for select
                 timeval timeout{};
-                timeout.tv_sec = 5;  // 5 seconds timeout
+                timeout.tv_sec = 5; // 5 seconds timeout
                 timeout.tv_usec = 0;
 
                 if (int ready = select(prev_rx_socket + 1, &read_fds, nullptr, nullptr, &timeout); ready == -1) {
@@ -243,8 +261,9 @@ int main(const int argc, char **argv) {
                 // Data is ready to be read
                 auto recv_start = std::chrono::high_resolution_clock::now();
                 ssize_t bytes_received_now = recv(prev_rx_socket,
-                                                 reinterpret_cast<uint8_t *>(recv_buffer.data()) + total_bytes_processed,
-                                                 to_read, 0);
+                                                  reinterpret_cast<uint8_t *>(recv_buffer.data()) +
+                                                  total_bytes_processed,
+                                                  to_read, 0);
                 auto recv_end = std::chrono::high_resolution_clock::now();
 
                 if (bytes_received_now == -1) {
@@ -262,7 +281,8 @@ int main(const int argc, char **argv) {
                 }
 
                 // Measure only the time spent in recv()
-                uint64_t recv_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(recv_end - recv_start).count();
+                uint64_t recv_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(recv_end - recv_start).
+                        count();
                 total_time_read_ns += recv_time_ns;
 
                 if (next_rank < world_size) {
@@ -273,11 +293,13 @@ int main(const int argc, char **argv) {
                     size_t bytes_sent_current = 0;
                     while (bytes_sent_current < bytes_received_now) {
                         const size_t tx_bytes_remaining = bytes_received_now - bytes_sent_current;
-                        const size_t to_send = tx_bytes_remaining < max_buffer_size ? tx_bytes_remaining : max_buffer_size;
+                        const size_t to_send = tx_bytes_remaining < max_buffer_size
+                                                   ? tx_bytes_remaining
+                                                   : max_buffer_size;
                         const size_t bytes_sent_now = send(next_tx_socket,
-                                                            reinterpret_cast<uint8_t *>(result.data()) +
-                                                            total_bytes_processed + bytes_sent_current,
-                                                            to_send, 0);
+                                                           reinterpret_cast<uint8_t *>(result.data()) +
+                                                           total_bytes_processed + bytes_sent_current,
+                                                           to_send, 0);
                         if (bytes_sent_now == -1) {
                             return 1;
                         }
@@ -313,13 +335,13 @@ int main(const int argc, char **argv) {
                 std::cerr << "[Rank: " << rank << "] Failed to receive cumulative time from previous rank" << std::endl;
                 return 1;
             }
-            const uint64_t cumulative_time = ntohll(cumulative_time_network);
+            const uint64_t cumulative_time = ntohl(cumulative_time_network);
             cumulative_recv_time += cumulative_time;
         }
     }
     if (next_rank < world_size) {
         // send cumulative time to next rank
-        const uint64_t cumulative_time_network = htonll(cumulative_recv_time);
+        const uint64_t cumulative_time_network = htonl(cumulative_recv_time);
         if (send(next_tx_socket, &cumulative_time_network, sizeof(cumulative_time_network), 0) == -1) {
             std::cerr << "[Rank: " << rank << "] Failed to send cumulative time to next rank" << std::endl;
             return 1;
