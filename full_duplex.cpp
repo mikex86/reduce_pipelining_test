@@ -221,7 +221,12 @@ int main(const int argc, char **argv) {
 
     const int next_tx_socket = peer_tx_sockets[next_rank];
 
-    uint64_t cumulative_recv_time = 0;
+    uint64_t cumulative_recv_time = 0; {
+        auto now = std::chrono::system_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+        std::cout << "Transmit begin for " << rank << "; unix timestamp (ms): " << duration.count() <<
+                std::endl;
+    }
 
     // perform main transmit loop
     {
@@ -360,9 +365,11 @@ int main(const int argc, char **argv) {
     }
     //std::cout << "[Rank: " << rank << "] Total recv time after rank " << rank << ": " << (
     //    static_cast<double>(cumulative_recv_time) / 1'000'000.0) << " ms" << std::endl;
-    auto now = std::chrono::system_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
-    std::cout << "Rank " << rank << " has completed the reduce phase; unix timestamp (ms): " << duration.count() <<
-            std::endl;
+    {
+        auto now = std::chrono::system_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+        std::cout << "Rank " << rank << " has completed the reduce phase; unix timestamp (ms): " << duration.count() <<
+                std::endl;
+    }
     return 0;
 }
