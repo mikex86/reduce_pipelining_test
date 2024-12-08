@@ -358,13 +358,11 @@ int main(const int argc, char **argv) {
         while (recv(next_tx_socket, &dummy, sizeof(dummy), 0) > 0) {
         }
     }
-    std::cout << "[Rank: " << rank << "] Total recv time after rank " << rank << ": " << (
-        static_cast<double>(cumulative_recv_time) / 1'000'000.0) << " ms" << std::endl;
-    if (next_rank == world_size) {
-        // the reduce phase of the ring reduce is complete
-        // we only simulate the reduce phase here because it is
-        // the most reliant on pipelining
-        std::cout << "Rank " << rank << " has completed the reduce phase." << std::endl;
-    }
+    //std::cout << "[Rank: " << rank << "] Total recv time after rank " << rank << ": " << (
+    //    static_cast<double>(cumulative_recv_time) / 1'000'000.0) << " ms" << std::endl;
+    auto now = std::chrono::system_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+    std::cout << "Rank " << rank << " has completed the reduce phase; unix timestamp (ms): " << duration.count() <<
+            std::endl;
     return 0;
 }
