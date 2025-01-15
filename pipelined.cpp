@@ -6,12 +6,13 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <sys/fcntl.h>
 #include <netinet/tcp.h>
 #include <unordered_map>
 #include <cstring>
 #include <vector>
 #include <sstream>
+#include <sys/fcntl.h>
+#include <poll.h>
 
 #define BASE_PORT 48148
 
@@ -19,19 +20,9 @@ void fill_constant(std::span<float> &span, const float value) {
     std::fill_n(span.data(), span.size(), value);
 }
 
-bool set_non_blocking(const int socket_fd) {
-    int flags = fcntl(socket_fd, F_GETFL, 0);
-    if (flags == -1) return false;
-    flags |= O_NONBLOCK;
-    return (fcntl(socket_fd, F_SETFL, flags) != -1);
-}
-
-bool set_blocking(const int socket_fd) {
-    int flags = fcntl(socket_fd, F_GETFL, 0);
-    if (flags == -1) return false;
-    flags &= ~O_NONBLOCK;
-    return (fcntl(socket_fd, F_SETFL, flags) != -1);
-}
+void pipelineReduce(const std::span<float> &array, int rank, int world_size,
+                    const std::unordered_map</* rank */int, /* socket fd */int> &peer_tx_sockets,
+                    const std::unordered_map</* rank */int, /* socket fd */int> &peer_rx_sockets);
 
 int main(const int argc, char **argv) {
     int rank{};
@@ -67,11 +58,6 @@ int main(const int argc, char **argv) {
         std::cerr << "Failed to set socket option" << std::endl;
         return 1;
     }
-    // disable nagle's algorithm
-    /*if (setsockopt(listen_socket, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(int)) == -1) {
-        std::cerr << "Failed to set TCP_NODELAY" << std::endl;
-        return 1;
-    }*/
 
     // bind to port
     sockaddr_in listen_address{};
@@ -164,10 +150,12 @@ int main(const int argc, char **argv) {
             int peer_port = BASE_PORT + i;
             sockaddr_in peer_address{};
             peer_address.sin_family = AF_INET;
+
             if (rank_ips.empty())
                 peer_address.sin_addr.s_addr = inet_addr("127.0.0.1");
             else
                 peer_address.sin_addr.s_addr = inet_addr(rank_ips[i].c_str());
+
             peer_address.sin_port = htons(peer_port);
 
             if (connect(tx_socket, reinterpret_cast<sockaddr *>(&peer_address), sizeof(peer_address)) == -1) {
@@ -204,161 +192,152 @@ int main(const int argc, char **argv) {
     accept_thread.join(); // wait for all rx connections to be established
     std::cout << "[Rank: " << rank << "] P2P RX connections established!" << std::endl;
 
+    // set all sockets to non-blocking
+    {
+        for (const auto &[_, socket]: peer_rx_sockets) {
+            if (fcntl(socket, F_SETFL, O_NONBLOCK) == -1) {
+                std::cerr << "Failed to set socket to non-blocking" << std::endl;
+                return 1;
+            }
+        }
+        for (const auto &[_, socket]: peer_tx_sockets) {
+            if (fcntl(socket, F_SETFL, O_NONBLOCK) == -1) {
+                std::cerr << "Failed to set socket to non-blocking" << std::endl;
+                return 1;
+            }
+        }
+    }
+
     const std::unique_ptr<float[]> result_ptr(new float[num_elements]);
     std::span result(result_ptr.get(), num_elements);
 
     fill_constant(result, 1.0f);
 
-    const auto start = std::chrono::system_clock::now();
-    int next_rank;
-    int prev_rank;
-    bool should_initiate_ring = false;
-    if (rank == 0) {
-        // rank 0 initiates the reduce operation
-        next_rank = 1;
-        prev_rank = -1;
-        should_initiate_ring = true;
-    } else {
-        next_rank = rank + 1;
-        prev_rank = rank - 1;
+    const auto start_time = std::chrono::system_clock::now();
+    pipelineReduce(result, rank, world_size, peer_tx_sockets, peer_rx_sockets);
+    const auto end_time = std::chrono::system_clock::now();
+
+    // assert all values are world_size (each rank contributes 1.0)
+    for (size_t i = 0; i < num_elements; ++i) {
+        assert(result[i] == static_cast<float>(world_size));
     }
 
-    const int next_tx_socket = peer_tx_sockets[next_rank];
-
-    uint64_t cumulative_recv_time = 0;
-    constexpr size_t max_buffer_size = (1 << 20) * 100; // 100 MB
-
-    int sndbuf_size = 8 * 1024 * 1024; // 8MB
-    int rcvbuf_size = 8 * 1024 * 1024; // 8MB
-    setsockopt(next_tx_socket, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
-
-    if (!should_initiate_ring && prev_rank >= 0) {
-        const int prev_rx_socket = peer_rx_sockets[prev_rank];
-        setsockopt(prev_rx_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
-        set_non_blocking(prev_rx_socket);
-
-        const std::unique_ptr<float[]> recv_buffer_ptr(new float[num_elements]);
-        const std::span recv_buffer(recv_buffer_ptr.get(), num_elements);
-
-        uint64_t total_time_read_ns = 0;
-
-        // receive data from previous rank
-        size_t bytes_received = 0;
-        while (bytes_received < recv_buffer.size_bytes()) {
-            // timed recv
-            {
-                const size_t bytes_remaining = recv_buffer.size_bytes() - bytes_received;
-                const size_t to_receive = std::min(bytes_remaining, max_buffer_size);
-                fd_set read_fds;
-                FD_ZERO(&read_fds);
-                FD_SET(prev_rx_socket, &read_fds);
-
-                // Optional: Set a timeout for select
-                timeval timeout{};
-                timeout.tv_sec = 5; // 5 seconds timeout
-                timeout.tv_usec = 0;
-
-                if (int ready = select(prev_rx_socket + 1, &read_fds, nullptr, nullptr, &timeout); ready == -1) {
-                    std::cerr << "[Rank: " << rank << "] select() failed: " << strerror(errno) << std::endl;
-                    return 1;
-                } else if (ready == 0) {
-                    // timed out, just retry...
-                    continue;
-                }
-
-                // Data is ready to be read
-                auto recv_start = std::chrono::high_resolution_clock::now();
-                ssize_t bytes_received_now = recv(prev_rx_socket,
-                                                  reinterpret_cast<uint8_t *>(recv_buffer.data()) + bytes_received,
-                                                  to_receive, 0);
-                auto recv_end = std::chrono::high_resolution_clock::now();
-
-                uint64_t recv_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(recv_end - recv_start).
-                        count();
-                total_time_read_ns += recv_time_ns;
-
-                if (bytes_received_now == -1) {
-                    if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                        // No data available, continue
-                        continue;
-                    }
-                    std::cerr << "[Rank: " << rank << "] Failed to receive data from previous rank: "
-                            << strerror(errno) << std::endl;
-                    return 1;
-                }
-                if (bytes_received_now == 0) {
-                    // Connection closed
-                    break;
-                }
-                bytes_received += bytes_received_now;
-            }
-        }
-
-        cumulative_recv_time += total_time_read_ns;
-
-        set_blocking(next_tx_socket);
-
-        // receive cumulative time from previous rank
-        uint64_t cumulative_time_network;
-        if (recv(prev_rx_socket, &cumulative_time_network, sizeof(cumulative_time_network), 0) == -1) {
-            std::cerr << "[Rank: " << rank << "] Failed to receive cumulative time from previous rank" << std::endl;
-            return 1;
-        }
-        const uint64_t cumulative_time = ntohl(cumulative_time_network);
-        cumulative_recv_time += cumulative_time;
-
-        // shutdown write side of rx socket
-        if (shutdown(prev_rx_socket, SHUT_WR) == -1) {
-            std::cerr << "[Rank: " << rank << "] Failed to shutdown write side of rx socket" << std::endl;
-            return 1;
-        }
-        // drain the socket to ensure complete transmission to the next rank (yes, this is necessary because tcp is weird)
-        uint8_t dummy{};
-        while (recv(prev_rx_socket, &dummy, sizeof(dummy), 0) > 0) {
-        }
-
-        /*
-        // perform reduction
-        for (size_t i = 0; i < num_elements; ++i) {
-            result[i] += recv_buffer[i];
-        }*/
-    }
-
-    if (next_rank < world_size) {
-        // send data to next rank
-        size_t bytes_sent = 0;
-        while (bytes_sent < result.size_bytes()) {
-            const size_t bytes_remaining = result.size_bytes() - bytes_sent;
-            const size_t to_send = std::min(bytes_remaining, max_buffer_size);
-            const size_t bytes_sent_now = send(next_tx_socket, reinterpret_cast<uint8_t *>(result.data()) + bytes_sent,
-                                               to_send, 0);
-            if (bytes_sent_now == -1) {
-                return 1;
-            }
-            bytes_sent += bytes_sent_now;
-        }
-        // send cumulative time to next rank
-        const uint64_t cumulative_time_network = htonl(cumulative_recv_time);
-        if (send(next_tx_socket, &cumulative_time_network, sizeof(cumulative_time_network), 0) == -1) {
-            std::cerr << "[Rank: " << rank << "] Failed to send cumulative time to next rank" << std::endl;
-            return 1;
-        }
-        // shutdown write side of tx socket
-        if (shutdown(next_tx_socket, SHUT_WR) == -1) {
-            std::cerr << "[Rank: " << rank << "] Failed to shutdown write side of tx socket" << std::endl;
-            return 1;
-        }
-        // drain the socket to ensure complete transmission to the next rank (yes, this is necessary because tcp is weird)
-        uint8_t dummy{};
-        while (recv(next_tx_socket, &dummy, sizeof(dummy), 0) > 0) {
-        }
-    }
-    //std::cout << "[Rank: " << rank << "] Total recv time after rank " << rank << ": " << (
-    //    static_cast<double>(cumulative_recv_time) / 1'000'000.0) << " ms" << std::endl;
-
-    auto now = std::chrono::system_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
-    std::cout << "Rank " << rank << " has completed the reduce phase in (ms): " << duration.count() << std::endl;
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    std::cout << "Rank " << rank << " has completed the reduce phase in (ms): " << duration.count() <<
+            std::endl;
 
     return 0;
+}
+
+void applyReduce(const std::span<float> &dst_buffer, const std::span<float> &src_buffer, const size_t start_offset,
+                 const size_t end_offset) {
+    assert(start_offset % sizeof(float) == 0);
+    assert(end_offset % sizeof(float) == 0);
+
+    const size_t start_idx = start_offset / sizeof(float);
+    const size_t end_idx = end_offset / sizeof(float);
+
+    assert(dst_buffer.size() == src_buffer.size());
+
+    float *__restrict__ dst = dst_buffer.data() + start_idx;
+    const float *__restrict__ src = src_buffer.data() + start_idx;
+
+    const size_t num_elements = end_idx - start_idx;
+    for (size_t i = 0; i < num_elements; ++i) {
+        dst[i] += src[i];
+    }
+}
+
+void pipelineReduce(const std::span<float> &array, const int rank, const int world_size,
+                    const std::unordered_map</* rank */int, /* socket fd */int> &peer_tx_sockets,
+                    const std::unordered_map</* rank */int, /* socket fd */int> &peer_rx_sockets) {
+    assert(array.size() % world_size == 0); // for simplicity
+
+    const size_t chunk_size = array.size() / world_size;
+
+    const std::unique_ptr<float[]> recv_buffer(new float[chunk_size]);
+    const std::span recv_span(recv_buffer.get(), chunk_size);
+
+    const std::unique_ptr<float[]> orig_bak(new float[array.size()]);
+    std::memcpy(orig_bak.get(), array.data(), array.size_bytes());
+    const std::span orig_data(orig_bak.get(), array.size());
+
+
+    for (int stage = 0; stage < world_size; stage++) {
+        // each peer has one tx and rx peer in the ring
+        // the rx peer is always the previous peer in the ring (with wrap-around)
+        // the tx peer is always the next peer in the ring (with wrap-around)
+        const int rx_peer = (rank - 1 + world_size) % world_size;
+        const int tx_peer = (rank + 1) % world_size;
+
+        const int rx_socket = peer_tx_sockets.at(rx_peer);
+        const int tx_socket = peer_rx_sockets.at(tx_peer);
+
+        // the tx chunk is the chunk we transmit
+        // the rx chunk is the chunk we receive
+        // they are different subsets of the array.
+        // Sending and receiving occurs concurrently to utilize full duplex.
+        // The tx & rx chunks is dependent on both rank and stage.
+        // They are constructed such that each peer after world size stages has accumulated all data.
+        const int rx_chunk = (world_size - stage - 1 + rank) % world_size;
+        const int tx_chunk = (world_size - stage - 1 + rank + 1) % world_size;
+
+        const std::span<float> tx_span = orig_data.subspan(tx_chunk * chunk_size, chunk_size);
+        const std::span<float> rx_span = array.subspan(rx_chunk * chunk_size, chunk_size);
+
+        // perform concurrent send and receive with fused reduce
+        {
+            size_t bytes_sent = 0;
+            size_t bytes_recvd = 0;
+
+            // We'll stage incoming data into recv_buffer, then copy to rx_span when complete
+            const auto recv_ptr = reinterpret_cast<char *>(recv_span.data());
+            const auto send_ptr = reinterpret_cast<const char *>(tx_span.data());
+
+            while (bytes_sent < tx_span.size_bytes() || bytes_recvd < rx_span.size_bytes()) {
+                pollfd fds[2];
+                // We want to poll for "ready to write" on tx_socket only if there's data left to send
+                fds[0].fd = tx_socket;
+                fds[0].events = bytes_sent < tx_span.size_bytes() ? POLLOUT : 0;
+
+                // We want to poll for "ready to read" on rx_socket only if we still expect more data
+                fds[1].fd = rx_socket;
+                fds[1].events = bytes_recvd < rx_span.size_bytes() ? POLLIN : 0;
+
+                if (const int rc = poll(fds, 2, /* timeout */ -1); rc < 0) {
+                    std::cerr << "poll() failed: " << strerror(errno) << std::endl;
+                    return;
+                }
+
+                // If tx_socket is ready to write, send some data
+                if ((fds[0].revents & POLLOUT) == POLLOUT) {
+                    const ssize_t s = send(tx_socket, send_ptr + bytes_sent,
+                                           tx_span.size_bytes() - bytes_sent, 0);
+                    if (s < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        std::cerr << "send() failed: " << strerror(errno) << std::endl;
+                    } else if (s > 0) {
+                        bytes_sent += s;
+                    }
+                }
+
+                // If rx_socket is ready to read, read some data
+                if ((fds[1].revents & POLLIN) == POLLIN) {
+                    const ssize_t r = recv(rx_socket, recv_ptr + bytes_recvd,
+                                           rx_span.size_bytes() - bytes_recvd, 0);
+                    if (r <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        std::cerr << "recv() failed: " << strerror(errno) << std::endl;
+                        return;
+                    }
+                    if (r > 0) {
+                        constexpr size_t el_size = sizeof(float);
+                        const size_t old_bytes_recvd_ceiled = (bytes_recvd + el_size - 1) / el_size * el_size;
+                        bytes_recvd += r;
+                        const size_t bytes_recvd_floored = (bytes_recvd / el_size) * el_size;
+                        assert(old_bytes_recvd_ceiled < bytes_recvd && bytes_recvd_floored <= bytes_recvd_floored);
+                        applyReduce(rx_span, recv_span, old_bytes_recvd_ceiled, bytes_recvd_floored);
+                    }
+                }
+            }
+        }
+    }
 }

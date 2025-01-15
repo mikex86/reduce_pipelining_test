@@ -1,0 +1,21 @@
+BUILD_FOLDER=cmake-build-release
+
+export RANK_IPS="127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1;127.0.0.1"
+
+$BUILD_FOLDER/pipelined_test 0 16 27264000 &
+$BUILD_FOLDER/pipelined_test 1 16 27264000 &
+$BUILD_FOLDER/pipelined_test 2 16 27264000 &
+$BUILD_FOLDER/pipelined_test 3 16 27264000 &
+$BUILD_FOLDER/pipelined_test 4 16 27264000 &
+$BUILD_FOLDER/pipelined_test 5 16 27264000 &
+$BUILD_FOLDER/pipelined_test 6 16 27264000 &
+$BUILD_FOLDER/pipelined_test 7 16 27264000 &
+$BUILD_FOLDER/pipelined_test 8 16 27264000 &
+$BUILD_FOLDER/pipelined_test 9 16 27264000 &
+$BUILD_FOLDER/pipelined_test 10 16 27264000 &
+$BUILD_FOLDER/pipelined_test 11 16 27264000 &
+$BUILD_FOLDER/pipelined_test 12 16 27264000 &
+$BUILD_FOLDER/pipelined_test 13 16 27264000 &
+$BUILD_FOLDER/pipelined_test 14 16 27264000 &
+$BUILD_FOLDER/pipelined_test 15 16 27264000 &
+wait
